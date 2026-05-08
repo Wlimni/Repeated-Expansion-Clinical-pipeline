@@ -16,6 +16,7 @@
 # =============================================================================
 # Dependencies: ExpansionHunter v5.0.0+, REViewer v0.2.7+, samtools, bcftools, curl
 # =============================================================================
+# conda install -c conda-forge -c bioconda expansionhunter reviewer samtools bcftools -y
 
 set -e
 set -u
