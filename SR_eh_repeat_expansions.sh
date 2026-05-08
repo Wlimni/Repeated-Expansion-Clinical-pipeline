@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Multi-locus STR Analysis with ExpansionHunter + STRipy + REViewer
-# ~ 5 min in this example
+# Short-read Multi-locus STR Analysis Pipeline with ExpansionHunter + STRipy + REViewer
+# ~ 5-10 min runtime (depending on BAM size and number of loci)
 # =============================================================================
-# Purpose: Detect pathogenic repeat expansions from short-read WGS data
-# Input:  Single sample ID (edit SAMPLE below)
-# Output: Genotype summary table + significant-only report + REViewer plots
+# Purpose: Detect pathogenic repeat expansions from Illumina short-read WGS data
+# Input:   Sample BAM file (e.g., G241713.bam) aligned to hg38
+# Output:  
+#   - multi_realigned.bam           : Reads realigned to repeat graph
+#   - multi_realigned.sorted.bam    : Sorted version for REViewer input
+#   - ${SAMPLE}_multi.vcf           : Raw ExpansionHunter VCF output
+#   - ${SAMPLE}_multi_annotated.vcf : Annotated with STRipy clinical info
+#   - ${SAMPLE}_multi_info.tsv      : Full summary table (all loci)
+#   - ${SAMPLE}_significant_only_info.tsv : Filtered table (pathogenic only)
+#   - reviewer/*.svg                : REViewer plots for each locus
+# =============================================================================
+# Dependencies: ExpansionHunter v5.0.0+, REViewer v0.2.7+, samtools, bcftools, curl
 # =============================================================================
 
 set -e
+set -u
 
 # =============================================================================
 # CONFIGURATION
@@ -16,8 +26,8 @@ set -e
 
 SAMPLE="G241713"
 REF="/home/gglab2/wgs/data/ref/Homo_sapiens_assembly38.fasta"
-FINAL_BAM="/home/gglab2/wgs/results_SR/${SAMPLE}/align/${SAMPLE}.bam"
-CATALOG="/home/gglab2/wgs/data/known_variant_catalog.json" # (From https://github.com/PacificBiosciences/trgt, include off-target)
+FINAL_BAM="/home/gglab2/wgs/data/align_G241713_SR/G241713.bam"
+CATALOG="/home/gglab2/wgs/data/SR/known_variant_catalog.json" # (From STRipy, includes off-target)
 OUTDIR="/home/gglab2/wgs/results_SR/${SAMPLE}/EH_multi"
 
 # =============================================================================
@@ -27,10 +37,8 @@ OUTDIR="/home/gglab2/wgs/results_SR/${SAMPLE}/EH_multi"
 mkdir -p "$OUTDIR"
 cd "$OUTDIR"
 
-EH_PREFIX="${SAMPLE}_multi"
-
 echo "================================================================================"
-echo "Multi-locus ExpansionHunter Analysis + STRipy Annotation"
+echo "Short-read STR Analysis Pipeline (ExpansionHunter + STRipy + REViewer)"
 echo "Sample: $SAMPLE"
 echo "Started: $(date)"
 echo "================================================================================"
@@ -41,7 +49,7 @@ echo "==========================================================================
 echo ""
 echo "[Step 1/6] Running ExpansionHunter on multi-locus catalog"
 
-if [[ -s "${EH_PREFIX}.vcf" ]]; then
+if [[ -s "${SAMPLE}_multi.vcf" ]]; then
     echo "  ✓ VCF already exists → skipping ExpansionHunter"
 else
     echo "  → Running ExpansionHunter..."
@@ -49,24 +57,24 @@ else
         --reads "$FINAL_BAM" \
         --reference "$REF" \
         --variant-catalog "$CATALOG" \
-        --output-prefix "$EH_PREFIX" \
+        --output-prefix "${SAMPLE}_multi" \
         --threads 12 \
-        --analysis-mode streaming 2> eh.log
+        --analysis-mode streaming
     echo "  ✓ ExpansionHunter completed"
 fi
 
 # =============================================================================
-# STEP 2: Prepare BAMlet
+# STEP 2: Prepare BAMlet for REViewer
 # =============================================================================
 echo ""
 echo "[Step 2/6] Preparing BAMlet for REViewer"
 
-if [[ -f "${EH_PREFIX}_realigned.sorted.bam" ]]; then
+if [[ -f "${SAMPLE}_multi_realigned.sorted.bam" ]]; then
     echo "  ✓ Sorted BAMlet already exists"
 else
     echo "  → Sorting and indexing BAMlet..."
-    samtools sort -@ 8 -o "${EH_PREFIX}_realigned.sorted.bam" "${EH_PREFIX}_realigned.bam"
-    samtools index "${EH_PREFIX}_realigned.sorted.bam"
+    samtools sort -@ 8 -o "${SAMPLE}_multi_realigned.sorted.bam" "${SAMPLE}_multi_realigned.bam"
+    samtools index "${SAMPLE}_multi_realigned.sorted.bam"
     echo "  ✓ BAMlet ready"
 fi
 
@@ -76,63 +84,112 @@ fi
 echo ""
 echo "[Step 3/6] Annotating VCF with STRipy"
 
-ANNOTATED_VCF="${EH_PREFIX}_annotated.vcf"
+ANNOTATED_VCF="${SAMPLE}_multi_annotated.vcf"
 
 if [[ -s "$ANNOTATED_VCF" ]]; then
     echo "  ✓ Annotated VCF already exists"
 else
     echo "  → Sending VCF to STRipy API..."
-    curl -F "file=@${EH_PREFIX}.vcf" https://api.stripy.org/annotateVCF > "$ANNOTATED_VCF"
+    curl -F "file=@${SAMPLE}_multi.vcf" https://api.stripy.org/annotateVCF > "$ANNOTATED_VCF"
     echo "  ✓ STRipy annotation completed"
 fi
 
 # =============================================================================
-# STEP 4: Create Summary Table
+# STEP 4: Create Summary Table (Robust VCF parsing)
 # =============================================================================
 echo ""
 echo "[Step 4/6] Creating Summary Table"
 
-SUMMARY_FILE="${EH_PREFIX}_summary.tsv"
+SUMMARY_FILE="${SAMPLE}_multi_info.tsv"
 
-{
-    echo -e "Locus\tGenotype\tRepeatCounts\tDisease\tInheritance\tRange"
-    grep -v "^#" "$ANNOTATED_VCF" | while read -r line; do
-        # Extract VARID from INFO column (locus name)
-        varid=$(echo "$line" | grep -oP 'VARID=\K[^;]+' || echo "UNKNOWN")
-        
-        # Extract genotype and repeat counts from FORMAT column
-        format=$(echo "$line" | cut -f9)
-        sample=$(echo "$line" | cut -f10)
-        
-        # Find REPCN position in FORMAT
-        repcn_pos=$(echo "$format" | tr ':' '\n' | grep -n '^REPCN$' | cut -d':' -f1)
-        if [[ -n "$repcn_pos" ]]; then
-            repcn=$(echo "$sample" | cut -d':' -f$repcn_pos)
-        else
-            repcn="N/A"
-        fi
-        
-        # Find GT position
-        gt_pos=$(echo "$format" | tr ':' '\n' | grep -n '^GT$' | cut -d':' -f1)
-        if [[ -n "$gt_pos" ]]; then
-            genotype=$(echo "$sample" | cut -d':' -f$gt_pos)
-        else
-            genotype="N/A"
-        fi
-        
-        # Extract clinical info from INFO
-        disname=$(echo "$line" | grep -oP 'DISNAME=\K[^;]+' || echo "N/A")
-        disinher=$(echo "$line" | grep -oP 'DISINHER=\K[^;]+' || echo "N/A")
-        disrange=$(echo "$line" | grep -oP 'DISRANGE=\K[^;]+' || echo "N/A")
-        
-        echo -e "$varid\t$genotype\t$repcn\t$disname\t$disinher\t$disrange"
-    done
-} > "$SUMMARY_FILE"
+# Create header with proper column names
+cat > "$SUMMARY_FILE" << 'EOF'
+#CHROM	POS	FILTER	END	Reference_Copy_Number	Reference_Length_bp	Repeat_Unit	Variant_ID	Disease_Name	Inheritance	Clinical_Range	Genotype	Support_Type	Repeat_Count	Confidence_Interval	Spanning_Reads	Flanking_Reads	InRepeat_Reads	Locus_Coverage
+EOF
 
-echo "  ✓ Summary table created: $SUMMARY_FILE"
-echo ""
-echo "  Preview:"
-column -t -s $'\t' "$SUMMARY_FILE" | head -40
+# Parse VCF with robust extraction
+awk -F'\t' '!/^#/ && NF >= 10 {
+    # Skip if CHROM or POS is empty
+    if ($1 == "" || $2 == "") next;
+    
+    # ----- Extract INFO fields (robust method) -----
+    varid = ""; disname = ""; disinher = ""; disrange = "";
+    end = ""; ref_cn = ""; rl = ""; ru = "";
+    
+    split($8, info, ";");
+    for(i in info) {
+        # Find position of "=" and extract after it
+        eq_pos = index(info[i], "=");
+        if(eq_pos > 0) {
+            key = substr(info[i], 1, eq_pos - 1);
+            val = substr(info[i], eq_pos + 1);
+            
+            if(key == "END") end = val;
+            else if(key == "REF") ref_cn = val;
+            else if(key == "RL") rl = val;
+            else if(key == "RU") ru = val;
+            else if(key == "VARID") varid = val;
+            else if(key == "DISNAME") disname = val;
+            else if(key == "DISINHER") disinher = val;
+            else if(key == "DISRANGE") disrange = val;
+        }
+    }
+    
+    # Skip if no Variant_ID (likely not a valid repeat locus)
+    if (varid == "") next;
+    
+    # ----- Extract FORMAT sample data -----
+    split($9, fmt, ":");
+    split($10, samp, ":");
+    
+    # Default values
+    gt = "./."; so = "./."; repcn = "./."; repci = "./."; 
+    adsp = "./."; adfl = "./."; adir = "./."; lc = "0";
+    
+    # Map format to values
+    for(i in fmt) {
+        val = samp[i];
+        if(fmt[i] == "GT") gt = val;
+        else if(fmt[i] == "SO") so = val;
+        else if(fmt[i] == "REPCN") repcn = val;
+        else if(fmt[i] == "REPCI") repci = val;
+        else if(fmt[i] == "ADSP") adsp = val;
+        else if(fmt[i] == "ADFL") adfl = val;
+        else if(fmt[i] == "ADIR") adir = val;
+        else if(fmt[i] == "LC") lc = val;
+    }
+    
+    # Skip rows where Genotype is "./." (no call) AND Repeat_Count is "./."
+    if (gt == "./." && repcn == "./.") next;
+    
+    # ----- Output -----
+    print $1 "\t" $2 "\t" $7 "\t" end "\t" ref_cn "\t" rl "\t" ru "\t" varid "\t" disname "\t" disinher "\t" disrange "\t" gt "\t" so "\t" repcn "\t" repci "\t" adsp "\t" adfl "\t" adir "\t" lc;
+}' "$ANNOTATED_VCF" >> "$SUMMARY_FILE"
+
+# Remove any empty lines from the file
+sed -i '/^$/d' "$SUMMARY_FILE"
+
+# Verify and preview
+if [[ -s "$SUMMARY_FILE" ]]; then
+    # Get actual row count (excluding header)
+    row_count=$(tail -n +2 "$SUMMARY_FILE" | wc -l)
+    
+    echo "  ✓ Summary table created: $SUMMARY_FILE"
+    echo "  ✓ Total rows (excluding header): $row_count"
+    echo ""
+    echo "  Preview (first 5 data rows):"
+    echo "  ---------------------------------------------------"
+    head -6 "$SUMMARY_FILE" | cut -f1,2,4,5,6,7,8,9,10,11
+    echo "  ---------------------------------------------------"
+    
+    # Quick validation check
+    echo ""
+    echo "  Validation check (Inheritance column):"
+    tail -n +2 "$SUMMARY_FILE" | cut -f10 | sort | uniq -c
+else
+    echo "  ❌ ERROR: Failed to create summary table"
+    exit 1
+fi
 
 # =============================================================================
 # STEP 5: Final Summary
@@ -140,8 +197,11 @@ column -t -s $'\t' "$SUMMARY_FILE" | head -40
 echo ""
 echo "[Step 5/6] Final Summary"
 
-total=$(grep -v "^#" "$ANNOTATED_VCF" | wc -l)
-significant=$(grep -c -E "DISRANGE=.*(Pathogenic|Intermediate)" "$ANNOTATED_VCF" || echo "0")
+# Count total loci (skip header lines)
+total=$(grep -v "^#" "$ANNOTATED_VCF" | grep -c -v "^$" || echo "0")
+
+# Count significant loci (Pathogenic or Intermediate in DISRANGE)
+significant=$(grep -v "^#" "$ANNOTATED_VCF" | grep -c -E "DISRANGE=.*(Pathogenic|Intermediate)" || echo "0")
 
 echo "  ┌─────────────────────────────────────────┐"
 echo "  │  SAMPLE: $SAMPLE"
@@ -153,96 +213,136 @@ echo "  └───────────────────────
 if [[ $significant -gt 0 ]]; then
     echo ""
     echo "  ⚠️  CLINICAL ALERT: Potentially significant loci found:"
-    grep -E "DISRANGE=.*(Pathogenic|Intermediate)" "$ANNOTATED_VCF" | while read -r line; do
+    grep -v "^#" "$ANNOTATED_VCF" | grep -E "DISRANGE=.*(Pathogenic|Intermediate)" | while read -r line; do
         varid=$(echo "$line" | grep -oP 'VARID=\K[^;]+' || echo "UNKNOWN")
         disrange=$(echo "$line" | grep -oP 'DISRANGE=\K[^;]+' || echo "N/A")
         echo "    • $varid: $disrange"
     done
 fi
+
 # =============================================================================
 # STEP 5.5: Create significant-only report
 # =============================================================================
 echo ""
 echo "[Step 5.5/6] Creating significant-only report"
 
+SIG_REPORT="${SAMPLE}_significant_only_info.tsv"
+
 if [[ $significant -gt 0 ]]; then
-    SIGNIFICANT_ONLY="${EH_PREFIX}_significant_only.tsv"
+    # Create header with same column names
+    cat > "$SIG_REPORT" << 'EOF'
+#CHROM	POS	FILTER	END	Reference_Copy_Number	Reference_Length_bp	Repeat_Unit	Variant_ID	Disease_Name	Inheritance	Clinical_Range	Genotype	Support_Type	Repeat_Count	Confidence_Interval	Spanning_Reads	Flanking_Reads	InRepeat_Reads	Locus_Coverage
+EOF
     
-    {
-        echo -e "Locus\tGenotype\tRepeatCounts\tDisease\tInheritance\tRange"
-        grep -E "DISRANGE=.*(Pathogenic|Intermediate)" "$ANNOTATED_VCF" | while read -r line; do
-            varid=$(echo "$line" | grep -oP 'VARID=\K[^;]+' || echo "UNKNOWN")
-            
-            format=$(echo "$line" | cut -f9)
-            sample=$(echo "$line" | cut -f10)
-            
-            repcn_pos=$(echo "$format" | tr ':' '\n' | grep -n '^REPCN$' | cut -d':' -f1)
-            if [[ -n "$repcn_pos" ]]; then
-                repcn=$(echo "$sample" | cut -d':' -f$repcn_pos)
-            else
-                repcn="N/A"
-            fi
-            
-            gt_pos=$(echo "$format" | tr ':' '\n' | grep -n '^GT$' | cut -d':' -f1)
-            if [[ -n "$gt_pos" ]]; then
-                genotype=$(echo "$sample" | cut -d':' -f$gt_pos)
-            else
-                genotype="N/A"
-            fi
-            
-            disname=$(echo "$line" | grep -oP 'DISNAME=\K[^;]+' || echo "N/A")
-            disinher=$(echo "$line" | grep -oP 'DISINHER=\K[^;]+' || echo "N/A")
-            disrange=$(echo "$line" | grep -oP 'DISRANGE=\K[^;]+' || echo "N/A")
-            
-            echo -e "$varid\t$genotype\t$repcn\t$disname\t$disinher\t$disrange"
-        done
-    } > "$SIGNIFICANT_ONLY"
+    # Parse only significant lines (Pathogenic or Intermediate in DISRANGE)
+    awk -F'\t' '!/^#/ && $8 ~ /Pathogenic|Intermediate/ {
+        # ----- Extract INFO fields -----
+        varid = ""; disname = ""; disinher = ""; disrange = "";
+        end = ""; ref_cn = ""; rl = ""; ru = "";
+        
+        split($8, info, ";");
+        for(i in info) {
+            eq_pos = index(info[i], "=");
+            if(eq_pos > 0) {
+                key = substr(info[i], 1, eq_pos - 1);
+                val = substr(info[i], eq_pos + 1);
+                
+                if(key == "END") end = val;
+                else if(key == "REF") ref_cn = val;
+                else if(key == "RL") rl = val;
+                else if(key == "RU") ru = val;
+                else if(key == "VARID") varid = val;
+                else if(key == "DISNAME") disname = val;
+                else if(key == "DISINHER") disinher = val;
+                else if(key == "DISRANGE") disrange = val;
+            }
+        }
+        
+        # ----- Extract FORMAT sample data -----
+        split($9, fmt, ":");
+        split($10, samp, ":");
+        
+        gt = "./."; so = "./."; repcn = "./."; repci = "./."; 
+        adsp = "./."; adfl = "./."; adir = "./."; lc = "0";
+        
+        for(i in fmt) {
+            val = samp[i];
+            if(fmt[i] == "GT") gt = val;
+            else if(fmt[i] == "SO") so = val;
+            else if(fmt[i] == "REPCN") repcn = val;
+            else if(fmt[i] == "REPCI") repci = val;
+            else if(fmt[i] == "ADSP") adsp = val;
+            else if(fmt[i] == "ADFL") adfl = val;
+            else if(fmt[i] == "ADIR") adir = val;
+            else if(fmt[i] == "LC") lc = val;
+        }
+        
+        # ----- Output -----
+        print $1 "\t" $2 "\t" $7 "\t" end "\t" ref_cn "\t" rl "\t" ru "\t" varid "\t" disname "\t" disinher "\t" disrange "\t" gt "\t" so "\t" repcn "\t" repci "\t" adsp "\t" adfl "\t" adir "\t" lc;
+    }' "$ANNOTATED_VCF" >> "$SIG_REPORT"
     
-    echo "  ✓ Significant-only report: $SIGNIFICANT_ONLY"
+    # Remove empty lines
+    sed -i '/^$/d' "$SIG_REPORT"
+    
+    sig_row_count=$(tail -n +2 "$SIG_REPORT" | wc -l)
+    echo "  ✓ Significant-only report: $SIG_REPORT ($sig_row_count loci)"
+    echo ""
+    echo "  Significant loci summary:"
+    echo "  -------------------------"
+    tail -n +2 "$SIG_REPORT" | cut -f8,10,11,14 | head -10
+    echo "  -------------------------"
 else
-    echo "  ✅ No significant loci - skipping significant-only report"
+    echo "  ✅ No significant loci found - skipping significant-only report"
 fi
 
 # =============================================================================
-# STEP 6: Plot significant loci
+# STEP 6: Plot significant loci with REViewer
 # =============================================================================
 echo ""
-echo "[Step 6/6] Plotting significant loci"
+echo "[Step 6/6] Plotting significant loci with REViewer"
 
 PLOTS_DIR="${OUTDIR}/reviewer"
 mkdir -p "$PLOTS_DIR"
 
-grep -E "DISRANGE=.*(Pathogenic|Intermediate)" "$ANNOTATED_VCF" | grep -oP 'VARID=\K[^;]+' | sort -u | while read -r LOCUS; do
-    echo "  → Plotting: $LOCUS"
-    
-    REViewer \
-        --reads "${EH_PREFIX}_realigned.sorted.bam" \
-        --vcf "$ANNOTATED_VCF" \
-        --reference "$REF" \
-        --catalog "$CATALOG" \
-        --locus "$LOCUS" \
-        --output-prefix "${PLOTS_DIR}/${LOCUS}" \
-        2> "${PLOTS_DIR}/reviewer_${LOCUS}.log" || true
-    
-    # Delete log file if empty
-    if [[ ! -s "${PLOTS_DIR}/reviewer_${LOCUS}.log" ]]; then
-        rm -f "${PLOTS_DIR}/reviewer_${LOCUS}.log"
-    fi
-    
-    
-    # Rename duplicate if needed and move to plots subdirectory
-    if [[ -f "${PLOTS_DIR}/${LOCUS}.${LOCUS}.svg" ]]; then
-        mv "${PLOTS_DIR}/${LOCUS}.${LOCUS}.svg" "${PLOTS_DIR}/${SAMPLE}_reviewer_${LOCUS}.svg"
-        echo "    ✓ Plot saved: ${PLOTS_DIR}/${SAMPLE}_reviewer_${LOCUS}.svg"
-    elif [[ -f "${PLOTS_DIR}/${LOCUS}.svg" ]]; then
-        mv "${PLOTS_DIR}/${LOCUS}.svg" "${PLOTS_DIR}/${SAMPLE}_reviewer_${LOCUS}.svg"
-        echo "    ✓ Plot saved: ${PLOTS_DIR}/${SAMPLE}_reviewer_${LOCUS}.svg"
-    else
-        echo "    ⚠️  Plot not found for ${LOCUS}"
-    fi
-done
+if [[ $significant -gt 0 ]]; then
+    # Extract unique locus names from significant lines
+    grep -v "^#" "$ANNOTATED_VCF" | grep -E "DISRANGE=.*(Pathogenic|Intermediate)" | grep -oP 'VARID=\K[^;]+' | sort -u | while read -r LOCUS; do
+        echo "  → Plotting: $LOCUS"
+        
+        REViewer \
+            --reads "${SAMPLE}_multi_realigned.sorted.bam" \
+            --vcf "$ANNOTATED_VCF" \
+            --reference "$REF" \
+            --catalog "$CATALOG" \
+            --locus "$LOCUS" \
+            --output-prefix "${PLOTS_DIR}/${LOCUS}" || true
+        
+        # Rename plot files to consistent naming
+        if [[ -f "${PLOTS_DIR}/${LOCUS}.${LOCUS}.svg" ]]; then
+            mv "${PLOTS_DIR}/${LOCUS}.${LOCUS}.svg" "${PLOTS_DIR}/${SAMPLE}_reviewer_${LOCUS}.svg"
+            echo "    ✓ Plot saved: ${PLOTS_DIR}/${SAMPLE}_reviewer_${LOCUS}.svg"
+        elif [[ -f "${PLOTS_DIR}/${LOCUS}.svg" ]]; then
+            mv "${PLOTS_DIR}/${LOCUS}.svg" "${PLOTS_DIR}/${SAMPLE}_reviewer_${LOCUS}.svg"
+            echo "    ✓ Plot saved: ${PLOTS_DIR}/${SAMPLE}_reviewer_${LOCUS}.svg"
+        else
+            echo "    ⚠️  Plot not found for ${LOCUS}"
+        fi
+    done
+else
+    echo "  ✅ No significant loci - skipping REViewer plots"
+fi
 
 echo "  ✓ Plotting complete"
+
+# =============================================================================
+# CLEANUP: Delete all empty log files
+# =============================================================================
+echo ""
+echo "[Cleanup] Removing empty log files..."
+
+find "$OUTDIR" -type f -name "*.log" -size 0 -delete 2>/dev/null
+
+echo "  ✓ Empty log files removed"
 
 # =============================================================================
 # PIPELINE COMPLETE
@@ -252,8 +352,9 @@ echo "==========================================================================
 echo "PIPELINE COMPLETED SUCCESSFULLY"
 echo "================================================================================"
 echo "Sample: $SAMPLE"
-echo "Summary: $SUMMARY_FILE"
-echo "Plots:   $PLOTS_DIR/*.svg"
+echo "Summary table: $SUMMARY_FILE"
+echo "Significant-only: $SIG_REPORT"
+echo "Plots directory: $PLOTS_DIR"
 echo "Completion time: $(date)"
 echo "================================================================================"
 
@@ -261,4 +362,5 @@ echo "==========================================================================
 echo ""
 echo "Output files:"
 ls -lh "$SUMMARY_FILE" 2>/dev/null || echo "  No summary file"
+ls -lh "$SIG_REPORT" 2>/dev/null || echo "  No significant report"
 ls -lh "$PLOTS_DIR"/*.svg 2>/dev/null || echo "  No plot files found"
