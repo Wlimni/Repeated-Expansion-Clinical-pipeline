@@ -3,6 +3,24 @@
 # Short-read Multi-locus STR Analysis Pipeline
 # ExpansionHunter + STRipy + REViewer
 # =============================================================================
+# Purpose: Detect pathogenic repeat expansions from Illumina short-read WGS data
+#          (Multi-locus analysis - analyzes all loci in the catalog)
+# =============================================================================
+# Input:
+#   - BAM/CRAM file (aligned to hg38)
+#   - Reference FASTA (hg38)
+#   - Variant catalog JSON (ExpansionHunter format)
+# =============================================================================
+# Output:
+#   - ${SAMPLE}_multi.vcf                    → Raw ExpansionHunter output
+#   - ${SAMPLE}_multi_annotated.vcf         → STRipy annotated VCF
+#   - ${SAMPLE}_multi_info.tsv              → Full table (ALL loci)
+#   - ${SAMPLE}_significant_only_info.tsv   → Only Pathogenic/Intermediate loci
+#   - ${SAMPLE}_multi_realigned.sorted.bam  → Realigned BAMlet for REViewer
+#   - reviewer/${SAMPLE}_*.svg              → REViewer plots for significant loci
+# =============================================================================
+# Dependencies: ExpansionHunter, REViewer, samtools, curl
+# =============================================================================
 
 set -euo pipefail
 
